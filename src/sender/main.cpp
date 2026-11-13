@@ -1,21 +1,17 @@
+// Sender firmware: the board in the mailbox. This file only deals with the hardware (battery
+// measurement, reed switch, deep sleep); what to send and when is decided by MailboxSender
+// in lib/mailbox_core.
 #include <Arduino.h>
 
 #include "driver/rtc_io.h"
-#include <SPI.h>
-#include <RadioLib.h>
-#include <sys/time.h>
 
 #include "heltec_v2_pins.h"
-#include "protocol.h"
-#include "radio_config.h"
-#include "sender_schedule.h"
+#include "mailbox_arduino.h"
+#include "mailbox_sender.h"
 
 using namespace mailbox;
 
 #define REED_PIN          GPIO_NUM_13   // reed switch GPIO13 <-> GND, closed = flap open
-#define MAX_ATTEMPTS      3             // how many times to send if no ACK
-#define ACK_TIMEOUT_MS    4000          // ACK wait time (an ACK at SF12 takes ~1.2 s)
-#define SERVICE_WINDOW_MS 10000         // after reset: time to upload firmware / open Serial Monitor
 
 // ---------- Battery ----------
 // WiFi LoRa 32 V2.1 (hardware >= 2.3): VBAT -> 220k/100k divider -> GPIO37, the divider is
@@ -24,21 +20,14 @@ using namespace mailbox;
 #define BATTERY_DIVIDER   3.2f          // (220k + 100k) / 100k – tune against a multimeter if needed
 #define BATTERY_SAMPLES   16
 
-SX1276 radio = new Module(LORA_NSS, LORA_DIO0, LORA_RST, LORA_DIO1);
+// message number and next heartbeat time – survive deep sleep
+RTC_DATA_ATTR SenderState senderState = {0, 0};
 
-volatile bool packetFlag = false;       // set by the DIO0 interrupt
-
-RTC_DATA_ATTR uint32_t msgId = 0;       // message number – survives deep sleep
-RTC_DATA_ATTR uint32_t nextBatteryReportS = 0;   // RTC time (s) of the next battery heartbeat
-
-uint16_t batteryMv = 0;                 // measured once per wake-up, before any transmission
-
-// Seconds on the RTC clock – keeps counting through deep sleep, restarts at 0 on power-on
-uint32_t nowS() {
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  return (uint32_t) tv.tv_sec;
-}
+SerialLogger logger;
+ArduinoClock clock_;
+ArduinoRandom randomSource;
+RadioLibRadio radio(logger, LED_PIN);   // LED is lit while transmitting
+MailboxSender sender(radio, clock_, randomSource, logger, senderState);
 
 // ================= Battery =================
 // Must run while the radio is idle: a 20 dBm transmission pulls the voltage down noticeably.
@@ -53,90 +42,6 @@ uint16_t readBatteryMv() {
   return (uint16_t) (sum / BATTERY_SAMPLES * BATTERY_DIVIDER);
 }
 
-// ================= LoRa =================
-void IRAM_ATTR onPacket() {
-  packetFlag = true;
-}
-
-void startListening() {
-  packetFlag = false;
-  int st = radio.startReceive();              // continuous receive – no gaps
-  if (st != RADIOLIB_ERR_NONE) Serial.printf("!! startReceive failed: %d\n", st);
-}
-
-bool configureLoRa() {
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
-  // RadioLib enables Low Data Rate Optimize automatically for SF11/SF12 at 125 kHz
-  int st = radio.begin(lora::kFrequencyMhz, lora::kBandwidthKhz, lora::kSpreadingFactor,
-                       lora::kCodingRate, lora::kSyncWord, lora::kTxPowerDbm,
-                       lora::kPreambleLength);
-  if (st == RADIOLIB_ERR_NONE) st = radio.setCRC(true);
-  if (st != RADIOLIB_ERR_NONE) {
-    Serial.printf("!! Radio init failed: %d\n", st);
-    return false;
-  }
-  radio.setPacketReceivedAction(onPacket);
-  return true;
-}
-
-bool waitForAck(uint32_t id) {
-  startListening();
-  unsigned long t0 = millis();
-  while (millis() - t0 < ACK_TIMEOUT_MS) {
-    if (packetFlag) {
-      String rx;
-      int st = radio.readData(rx);
-      if (st == RADIOLIB_ERR_NONE) {
-        Serial.printf("Received: %s (RSSI %d, SNR %.1f)\n",
-                      rx.c_str(), (int) radio.getRSSI(), radio.getSNR());
-        uint32_t ackId;
-        if (parseAck(rx.c_str(), ackId) && ackId == id) return true;
-      } else if (st == RADIOLIB_ERR_CRC_MISMATCH) {
-        Serial.println("!! Packet dropped: CRC error");
-      } else {
-        Serial.printf("!! readData failed: %d\n", st);
-      }
-      startListening();                                  // foreign or corrupted – keep listening
-    }
-    delay(2);
-  }
-  return false;
-}
-
-// Sends the message and waits for its ACK. Every message carries the battery voltage,
-// so a flap event doubles as a battery report.
-bool sendMessage(MessageType type) {
-  Message m;
-  m.type = type;
-  m.id = msgId;
-  m.batteryMv = batteryMv;
-  String msg = encodeMessage(m).c_str();
-
-  bool acked = false;
-  for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    digitalWrite(LED_PIN, HIGH);
-    int st = radio.transmit(msg);             // blocks until transmission ends (~1.3 s)
-    digitalWrite(LED_PIN, LOW);
-    if (st == RADIOLIB_ERR_NONE) {
-      Serial.printf("Attempt %d/%d: sent %s\n", attempt, MAX_ATTEMPTS, msg.c_str());
-    } else {
-      Serial.printf("Attempt %d/%d: transmit failed: %d\n", attempt, MAX_ATTEMPTS, st);
-    }
-
-    if (waitForAck(msgId)) {
-      Serial.println("ACK received");
-      acked = true;
-      break;
-    }
-    Serial.println("No ACK");
-    if (attempt < MAX_ATTEMPTS) delay(random(500, 2000));   // random back-off before retry
-  }
-  if (!acked) Serial.println("Message was not acknowledged");
-  msgId++;
-  nextBatteryReportS = nextReportAfterSend(type, acked, nowS(), nextBatteryReportS);
-  return acked;
-}
-
 // ================= Sleep =================
 void goToSleep() {
   bool stillOpen = (digitalRead(REED_PIN) == LOW);
@@ -145,7 +50,7 @@ void goToSleep() {
   digitalWrite(LED_PIN, LOW);
   digitalWrite(VEXT_PIN, HIGH);               // OLED off
 
-  SleepPlan plan = planSleep(stillOpen, nowS(), nextBatteryReportS);
+  SleepPlan plan = sender.planSleep(stillOpen);
   esp_sleep_enable_timer_wakeup(plan.seconds * 1000000ULL);
   if (plan.wakeOnReed) {
     Serial.printf("Sleeping until the flap opens (battery report in %u s)\n", plan.seconds);
@@ -178,38 +83,20 @@ void setup() {
   pinMode(VEXT_PIN, OUTPUT);
   digitalWrite(VEXT_PIN, HIGH);               // display not needed in the mailbox
   pinMode(LED_PIN, OUTPUT);
-  batteryMv = readBatteryMv();                // before any transmission
+  uint16_t batteryMv = readBatteryMv();       // once per wake-up, before any transmission
   Serial.printf("Battery: %u mV\n", batteryMv);
   randomSeed(esp_random());
 
-  if (!configureLoRa()) {
+  int st = radio.begin();
+  if (st != RADIOLIB_ERR_NONE) {
+    Serial.printf("!! Radio init failed: %d\n", st);
     // no radio – nothing can be sent; don't let an overdue heartbeat wake us every second
-    if (nowS() >= nextBatteryReportS) nextBatteryReportS = nowS() + kBatteryRetryS;
+    uint32_t now = clock_.rtcSeconds();
+    if (now >= senderState.nextBatteryReportS) senderState.nextBatteryReportS = now + kBatteryRetryS;
     goToSleep();
   }
 
-  switch (decideWakeAction(cause, nowS(), nextBatteryReportS)) {
-    case WakeAction::SendMailboxOpen:
-      Serial.println("Wake-up: flap opened");
-      sendMessage(MessageType::MailboxOpen);
-      break;
-
-    case WakeAction::SendBattery:
-      Serial.println("Wake-up: battery report");
-      sendMessage(MessageType::Battery);
-      break;
-
-    case WakeAction::CheckFlapOnly:
-      Serial.println("Wake-up: checking whether the flap has closed");
-      break;
-
-    case WakeAction::ServiceWindowThenBattery:
-      Serial.println("Power-on / reset - service window");
-      delay(SERVICE_WINDOW_MS);
-      sendMessage(MessageType::Battery);
-      break;
-  }
-
+  sender.onWake(cause, batteryMv);
   goToSleep();
 }
 

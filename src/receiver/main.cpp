@@ -1,18 +1,18 @@
+// Receiver firmware: the indoor board. This file deals with the hardware and the network
+// (OLED, button, LED, Wi-Fi, MQTT); packets, ACKs and the mail state are handled by
+// MailboxReceiver in lib/mailbox_core.
 #include <Arduino.h>
 
 #include <WiFi.h>
 #include <PubSubClient.h>
-#include <SPI.h>
 #include <Wire.h>
-#include <RadioLib.h>
 #include <SSD1306Wire.h>
 #include "arduino_secrets.h"   // Wi-Fi and MQTT – see arduino_secrets.h.example
 
 #include "battery.h"
 #include "heltec_v2_pins.h"
-#include "mail_tracker.h"
-#include "protocol.h"
-#include "radio_config.h"
+#include "mailbox_arduino.h"
+#include "mailbox_receiver.h"
 #include "time_format.h"
 
 using namespace mailbox;
@@ -40,13 +40,23 @@ const char* MQTT_PASS    = SECRET_MQTT_PASS;
 #define T_BATT   "custom/mailbox/battery"          // sender battery, 0–100 %
 #define T_BATT_V "custom/mailbox/battery_voltage"  // sender battery, volts
 
-SX1276 radio = new Module(LORA_NSS, LORA_DIO0, LORA_RST, LORA_DIO1);
+// The mail state is read by the network task on core 0 and written by loop() on core 1.
+class PortMutex : public Mutex {
+ public:
+  void lock() override { taskENTER_CRITICAL(&mux_); }
+  void unlock() override { taskEXIT_CRITICAL(&mux_); }
+
+ private:
+  portMUX_TYPE mux_ = portMUX_INITIALIZER_UNLOCKED;
+};
+
+SerialLogger logger;
+ArduinoClock clock_;
+PortMutex stateMutex;
+RadioLibRadio radio(logger);
+MailboxReceiver receiver(radio, clock_, logger, stateMutex);
+
 SSD1306Wire display(0x3c, OLED_SDA, OLED_SCL);
-
-volatile bool packetFlag = false;       // set by the DIO0 interrupt
-
-MailTracker tracker;                              // state shared between cores, guarded by stateMux
-portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
 
 volatile bool statePending   = false;   // LoRa -> network: "publish new state"
 volatile bool resetRequested = false;   // network -> LoRa: "RESET from Home Assistant"
@@ -61,27 +71,9 @@ unsigned long mailTime = 0;
 bool screenOn = true;                   // OLED state (core 1 only)
 unsigned long screenOnSince = 0;        // last activity that kept the display on
 
-// ================= Radio =================
-void IRAM_ATTR onPacket() {
-  packetFlag = true;
-}
-
-void startListening() {
-  packetFlag = false;
-  int st = radio.startReceive();              // continuous receive
-  if (st != RADIOLIB_ERR_NONE) Serial.printf("!! startReceive failed: %d\n", st);
-}
-
-MailState getState() {
-  taskENTER_CRITICAL(&stateMux);
-  MailState copy = tracker.state();
-  taskEXIT_CRITICAL(&stateMux);
-  return copy;
-}
-
 // ================= Core 0: Wi-Fi + MQTT =================
 void publishState() {
-  MailState s = getState();
+  MailState s = receiver.state();
   mqtt.publish(T_MAIL, s.mail ? "ON" : "OFF", true);
   mqtt.publish(T_COUNT, String(s.count).c_str(), true);
   if (s.hasPacket) {
@@ -146,12 +138,7 @@ void netTask(void *param) {
 
 // ================= Core 1: LoRa, display, button =================
 void configureLoRa() {
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
-  // RadioLib enables Low Data Rate Optimize automatically for SF11/SF12 at 125 kHz
-  int st = radio.begin(lora::kFrequencyMhz, lora::kBandwidthKhz, lora::kSpreadingFactor,
-                       lora::kCodingRate, lora::kSyncWord, lora::kTxPowerDbm,
-                       lora::kPreambleLength);
-  if (st == RADIOLIB_ERR_NONE) st = radio.setCRC(true);
+  int st = radio.begin();
   if (st != RADIOLIB_ERR_NONE) {
     Serial.printf("!! Radio init failed: %d\n", st);
     display.clear();
@@ -159,12 +146,11 @@ void configureLoRa() {
     display.display();
     for (;;) delay(1000);
   }
-  radio.setPacketReceivedAction(onPacket);
 }
 
 void drawScreen() {
   if (!screenOn) return;                      // display off – nothing to draw
-  MailState s = getState();
+  MailState s = receiver.state();
 
   display.clear();
   display.setTextAlignment(TEXT_ALIGN_LEFT);
@@ -205,60 +191,31 @@ void sleepScreen() {
 }
 
 void clearMail() {
-  taskENTER_CRITICAL(&stateMux);
-  tracker.clearMail();
-  taskEXIT_CRITICAL(&stateMux);
+  receiver.clearMail();
   digitalWrite(LED_PIN, LOW);
   statePending = true;
   drawScreen();
 }
 
-void sendAck(uint32_t id) {
-  delay(100);                                 // give the sender time to switch to receive
-  String ack = encodeAck(id).c_str();
-  int st = radio.transmit(ack);               // blocks until transmission ends
-  startListening();                           // back to continuous receive
-  if (st == RADIOLIB_ERR_NONE) Serial.println("Sent " + ack);
-  else Serial.printf("!! ACK transmit failed: %d\n", st);
-}
+void handleRadio() {
+  switch (receiver.poll()) {
+    case MailboxReceiver::Event::NewMail:
+      mailTime = millis();
+      digitalWrite(LED_PIN, HIGH);
+      statePending = true;                    // core 0 will publish this to MQTT
+      wakeScreen();                           // new mail – show it
+      break;
 
-void handlePacket() {
-  String p;
-  int st = radio.readData(p);
-  int rssi = (int) radio.getRSSI();
-  float snr = radio.getSNR();
-  if (st != RADIOLIB_ERR_NONE) {
-    if (st == RADIOLIB_ERR_CRC_MISMATCH) Serial.println("!! Packet dropped: CRC error");
-    else Serial.printf("!! readData failed: %d\n", st);
-    startListening();
-    return;
+    case MailboxReceiver::Event::Duplicate:
+    case MailboxReceiver::Event::BatteryReport:
+      statePending = true;                    // signal / battery readings changed
+      drawScreen();
+      break;
+
+    case MailboxReceiver::Event::Ignored:
+    case MailboxReceiver::Event::None:
+      break;
   }
-
-  Serial.printf("Received: %s | RSSI %d dBm | SNR %.1f dB\n", p.c_str(), rssi, snr);
-
-  Message msg;
-  if (!parseMessage(p.c_str(), msg)) {
-    startListening();                         // foreign packet – go straight back to listening
-    return;
-  }
-  sendAck(msg.id);                            // ACK immediately (radio returns to receive afterwards)
-
-  taskENTER_CRITICAL(&stateMux);
-  bool isNew = tracker.onMessage(msg, rssi, snr, millis());
-  taskEXIT_CRITICAL(&stateMux);
-
-  if (msg.type == MessageType::Battery) {
-    Serial.printf("Battery report: %u mV (%d %%)\n", msg.batteryMv, batteryPercent(msg.batteryMv));
-  } else if (isNew) {
-    mailTime = millis();
-    digitalWrite(LED_PIN, HIGH);
-  } else {
-    Serial.println("Duplicate - already counted");
-  }
-
-  statePending = true;                        // core 0 will publish this to MQTT
-  if (isNew) wakeScreen();                    // new mail – show it
-  else drawScreen();
 }
 
 // ================= Setup / loop =================
@@ -282,14 +239,11 @@ void setup() {
   xTaskCreatePinnedToCore(netTask, "net", 8192, NULL, 1, NULL, 0);
 
   Serial.println("Receiver ready, waiting for the mailbox to open...");
-  startListening();
+  receiver.begin();
 }
 
 void loop() {
-  if (packetFlag) {
-    packetFlag = false;
-    handlePacket();
-  }
+  handleRadio();
 
   if (resetRequested) {                       // RESET from Home Assistant
     resetRequested = false;
@@ -303,7 +257,7 @@ void loop() {
       wakeScreen();                           // first press only wakes the display
     } else {
       screenOnSince = millis();               // keep the display on
-      if (getState().mail) clearMail();       // PRG = "mail collected"
+      if (receiver.state().mail) clearMail();       // PRG = "mail collected"
     }
     delay(50);                                // debounce
   }
