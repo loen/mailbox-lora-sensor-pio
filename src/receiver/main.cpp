@@ -28,6 +28,9 @@ const char* MQTT_USER    = SECRET_MQTT_USER;
 const char* MQTT_PASS    = SECRET_MQTT_PASS;
 
 #define SCREEN_TIMEOUT_MS 60000   // OLED turns off after this much inactivity (prevents burn-in)
+#define WIFI_RESTART_MS   60000   // restart the Wi-Fi connection if auto-reconnect has not
+                                  // brought it back within this time
+#define MQTT_RETRY_MS     5000    // pause between MQTT connection attempts
 
 // ---------- MQTT topics (must match configuration.yaml) ----------
 #define MQTT_CLIENT_ID "mailbox_lora"
@@ -62,6 +65,7 @@ volatile bool statePending   = false;   // LoRa -> network: "publish new state"
 volatile bool resetRequested = false;   // network -> LoRa: "RESET from Home Assistant"
 volatile bool netWifiOk      = false;   // network status for the display
 volatile bool netMqttOk      = false;
+volatile int netMqttState    = MQTT_DISCONNECTED;   // PubSubClient state code, shown when not connected
 
 WiFiClient espClient;
 PubSubClient mqtt(espClient);
@@ -72,18 +76,20 @@ bool screenOn = true;                   // OLED state (core 1 only)
 unsigned long screenOnSince = 0;        // last activity that kept the display on
 
 // ================= Core 0: Wi-Fi + MQTT =================
-void publishState() {
+// Returns false if any of the messages could not be sent.
+bool publishState() {
   MailState s = receiver.state();
-  mqtt.publish(T_MAIL, s.mail ? "ON" : "OFF", true);
-  mqtt.publish(T_COUNT, String(s.count).c_str(), true);
+  bool ok = mqtt.publish(T_MAIL, s.mail ? "ON" : "OFF", true);
+  ok &= mqtt.publish(T_COUNT, String(s.count).c_str(), true);
   if (s.hasPacket) {
-    mqtt.publish(T_RSSI, String(s.rssi).c_str(), true);
-    mqtt.publish(T_SNR, String(s.snr, 1).c_str(), true);
+    ok &= mqtt.publish(T_RSSI, String(s.rssi).c_str(), true);
+    ok &= mqtt.publish(T_SNR, String(s.snr, 1).c_str(), true);
   }
   if (s.batteryMv > 0) {
-    mqtt.publish(T_BATT, String(batteryPercent(s.batteryMv)).c_str(), true);
-    mqtt.publish(T_BATT_V, String(s.batteryMv / 1000.0, 2).c_str(), true);
+    ok &= mqtt.publish(T_BATT, String(batteryPercent(s.batteryMv)).c_str(), true);
+    ok &= mqtt.publish(T_BATT_V, String(s.batteryMv / 1000.0, 2).c_str(), true);
   }
+  return ok;
 }
 
 void mqttCallback(char *topic, byte *payload, unsigned int len) {
@@ -105,11 +111,27 @@ void netTask(void *param) {
   mqtt.setSocketTimeout(2);
 
   unsigned long lastTry = 0;
+  unsigned long wifiDownSince = millis();
 
   for (;;) {
-    netWifiOk = (WiFi.status() == WL_CONNECTED);
+    bool wifiOk = (WiFi.status() == WL_CONNECTED);
+    if (wifiOk != netWifiOk) {
+      Serial.println(wifiOk ? "Wi-Fi: connected" : "Wi-Fi: connection lost");
+      netWifiOk = wifiOk;
+    }
 
-    if (netWifiOk && !mqtt.connected() && millis() - lastTry >= 5000) {
+    // Auto-reconnect does not always bring the connection back (e.g. after a long access
+    // point outage), so start it again from scratch when it has been down for too long.
+    if (wifiOk) {
+      wifiDownSince = millis();
+    } else if (millis() - wifiDownSince >= WIFI_RESTART_MS) {
+      Serial.println("Wi-Fi: still down, restarting the connection");
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      wifiDownSince = millis();
+    }
+
+    if (wifiOk && !mqtt.connected() && millis() - lastTry >= MQTT_RETRY_MS) {
       lastTry = millis();
       Serial.print("MQTT: connecting... ");
       // may block for a few seconds – fine here, LoRa runs on the other core
@@ -124,11 +146,16 @@ void netTask(void *param) {
     }
 
     netMqttOk = mqtt.connected();
+    netMqttState = mqtt.state();
     if (netMqttOk) {
       mqtt.loop();
       if (statePending) {
+        // cleared before publishing, so a change made meanwhile on core 1 is not lost
         statePending = false;
-        publishState();
+        if (!publishState()) {
+          Serial.println("MQTT: publish failed, will retry");
+          statePending = true;                    // sent again once the connection is back
+        }
       }
     }
 
@@ -162,8 +189,10 @@ void drawScreen() {
   if (s.mail) {
     display.drawString(0, 20, "Opened " + String(formatAgo(millis() - mailTime).c_str()) + " ago");
   }
-  String net = String("WiFi:") + (netWifiOk ? "OK" : "--") +
-               " MQTT:" + (netMqttOk ? "OK" : "--");
+  // MQTT shows the PubSubClient state code while disconnected, e.g. -2 = broker unreachable,
+  // 4/5 = rejected credentials
+  String mqttStatus = netMqttOk ? String("OK") : !netWifiOk ? String("--") : String(netMqttState);
+  String net = String("WiFi:") + (netWifiOk ? "OK" : "--") + " MQTT:" + mqttStatus;
   display.drawString(0, 36, "Opens: " + String(s.count) + "  " + net);
   if (s.hasPacket) {
     display.drawString(0, 50, "RSSI " + String(s.rssi) + "  SNR " + String(s.snr, 1));
