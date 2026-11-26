@@ -1,5 +1,13 @@
 # mailbox-lora-sensor-pio
 
+<p align="center">
+  <img src="docs/images/receiver.jpg" width="640"
+       alt="The receiver: Heltec WiFi LoRa 32 V2 with the OLED showing new mail, sender battery, Wi-Fi/MQTT status and LoRa RSSI/SNR">
+  <br>
+  <em>The indoor receiver: new mail, sender battery, network status and the RSSI/SNR of the last
+  LoRa packet.</em>
+</p>
+
 A LoRa mailbox notifier: a battery-powered sensor in the mailbox reports over a long-range,
 low-power radio link when the flap is opened, and an indoor gateway turns those reports into
 Home Assistant entities over MQTT.

@@ -192,7 +192,8 @@ void drawScreen() {
   // MQTT shows the PubSubClient state code while disconnected, e.g. -2 = broker unreachable,
   // 4/5 = rejected credentials
   String mqttStatus = netMqttOk ? String("OK") : !netWifiOk ? String("--") : String(netMqttState);
-  String net = String("WiFi:") + (netWifiOk ? "OK" : "--") + " MQTT:" + mqttStatus;
+  // short labels: "Opens: <n>  WiFi:OK MQTT:OK" does not fit in 128 px
+  String net = String("W:") + (netWifiOk ? "OK" : "--") + " M:" + mqttStatus;
   display.drawString(0, 36, "Opens: " + String(s.count) + "  " + net);
   if (s.hasPacket) {
     display.drawString(0, 50, "RSSI " + String(s.rssi) + "  SNR " + String(s.snr, 1));
