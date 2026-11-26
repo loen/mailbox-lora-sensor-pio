@@ -69,6 +69,26 @@ The cost is time on air:
 Even the worst case (three attempts plus back-off, about 22 s) uses a small fraction of the
 360 s per hour that the 10 % duty cycle allows.
 
+### Measured link margin
+
+The receiver publishes the RSSI and SNR of every packet to Home Assistant. A reading from the
+closed mailbox, with the final antenna and modem settings, is **RSSI −113 dBm** and
+**SNR +1.3 dB**.
+
+| | Measured | Limit at SF12, BW 125 kHz | Margin |
+|---|---|---|---|
+| Signal strength | −113 dBm | about −136 dBm sensitivity | about 23 dB |
+| Signal-to-noise ratio | +1.3 dB | about −20 dB demodulation floor | about 21 dB |
+
+The SNR margin is the more meaningful of the two, because it accounts for the actual noise
+at the receiver and not just the datasheet sensitivity. About 21 dB of margin means the link
+would survive more than a hundredfold drop in received power, for example from rain, a wet
+door, or a parked car, before packets start to fail. This is a single reading; the published
+values let the margin be tracked over time.
+
+For comparison, at SF7 the demodulation floor is about −7.5 dB SNR, which would leave only
+about 9 dB of margin on the same path.
+
 ## How the link was improved
 
 The first version used the boards out of the box: the stock antenna and default modem settings

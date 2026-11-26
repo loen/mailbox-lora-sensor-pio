@@ -18,6 +18,27 @@ the protocol logic is covered by unit and integration tests that run on a comput
 - **Tested without hardware.** Unit and integration tests run the sender and the receiver over
   a simulated lossy channel, in CI with AddressSanitizer and UBSan.
 
+## Home Assistant
+
+<table>
+  <tr>
+    <td align="center" valign="middle">
+      <img src="docs/images/ha-entities.jpg" width="300"
+           alt="Mailbox device in Home Assistant: mail state, opening count, battery, RSSI and SNR">
+    </td>
+    <td align="center" valign="middle">
+      <img src="docs/images/ha-notification.png" width="420"
+           alt="Push notification on the phone: You've got mail">
+    </td>
+  </tr>
+  <tr>
+    <td align="center">Device entities: mail state, opening count, sender battery, and LoRa link
+      quality (RSSI/SNR) as diagnostics</td>
+    <td align="center">Push notification on the phone, sent by a Home Assistant automation when
+      the flap opens</td>
+  </tr>
+</table>
+
 ## Overview
 
 The **sender** is in the mailbox. It spends nearly all its time in ESP32 deep sleep. A reed
@@ -82,6 +103,7 @@ noise floor.
 | Modulation | LoRa SF12, BW 125 kHz, CR 4/8, CRC on |
 | Sensitivity / link budget | about −136 dBm / about 156 dB |
 | Time on air | about 2.0 s per message, 1.2 s per ACK |
+| Measured at the receiver | RSSI −113 dBm, SNR +1.3 dB: about **21–23 dB of link margin** |
 
 The first version, with the stock antenna and default modem settings, was unreliable. Three
 changes made the link dependable, each on a different layer:
